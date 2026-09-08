@@ -1,9 +1,16 @@
 "use client";
 
-import { ArrowDown, CornerDownRight, Download, LoaderCircle, Network, RotateCcw, Split, Undo2 } from "lucide-react";
-import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ArrowDown, Check, CornerDownRight, Download, FileDown, FileUp, LoaderCircle, Network, Pencil, RotateCcw, Split, Undo2, X } from "lucide-react";
+import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type Subnet = { cidr: string; network: number; prefix: number };
+type PlannerDocument = {
+  format: "subnet-studio";
+  version: 1;
+  root: string;
+  splits: string[];
+  names: Record<string, string>;
+};
 const INITIAL_CIDR = "10.0.0.0/16";
 
 function numberToIp(value: number) {
@@ -47,48 +54,130 @@ function isWithinSubnet(cidr: string, parent: Subnet) {
     && candidate.network < parent.network + parentSize;
 }
 
-function SubnetNode({ subnet, splitIds, collapsingIds, onToggle }: {
+function parsePlannerDocument(value: unknown): { root: Subnet; splits: string[]; names: Record<string, string> } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The JSON must contain a Subnet Studio document.");
+
+  const document = value as Partial<PlannerDocument>;
+  if (document.format !== "subnet-studio" || document.version !== 1) throw new Error("This JSON format or version is not supported.");
+  if (typeof document.root !== "string") throw new Error("The root network is missing.");
+
+  const root = parseCidr(document.root);
+  if (!root || root.cidr !== document.root) throw new Error("The root network must be a canonical IPv4 CIDR.");
+  if (!Array.isArray(document.splits) || document.splits.length > 2048) throw new Error("The split history is invalid or too large.");
+
+  const available = new Set([root.cidr]);
+  const splits: string[] = [];
+  for (const cidr of document.splits) {
+    const subnet = typeof cidr === "string" ? parseCidr(cidr) : null;
+    if (!subnet || subnet.cidr !== cidr || subnet.prefix === 32 || !available.has(cidr)) {
+      throw new Error(`The split history is invalid at ${String(cidr)}.`);
+    }
+    available.delete(cidr);
+    childSubnets(subnet).forEach((child) => available.add(child.cidr));
+    splits.push(cidr);
+  }
+
+  if (!document.names || typeof document.names !== "object" || Array.isArray(document.names)) throw new Error("The block names are invalid.");
+  const nameEntries = Object.entries(document.names);
+  if (nameEntries.length > 4096) throw new Error("The document contains too many block names.");
+
+  const names: Record<string, string> = {};
+  for (const [cidr, value] of nameEntries) {
+    const subnet = parseCidr(cidr);
+    if (!subnet || subnet.cidr !== cidr || !isWithinSubnet(cidr, root) || typeof value !== "string" || !value.trim() || value.trim().length > 32) {
+      throw new Error(`The block name for ${cidr} is invalid.`);
+    }
+    names[cidr] = value.trim();
+  }
+
+  return { root, splits, names };
+}
+
+function SubnetNode({ subnet, name, nameByCidr, splitIds, collapsingIds, onRename, onToggle }: {
   subnet: Subnet;
+  name: string;
+  nameByCidr: Record<string, string>;
   splitIds: Set<string>;
   collapsingIds: Set<string>;
+  onRename: (cidr: string, name: string) => void;
   onToggle: (subnet: Subnet) => void;
 }) {
   const isSplit = splitIds.has(subnet.cidr);
   const isCollapsing = collapsingIds.has(subnet.cidr);
   const canSplit = subnet.prefix < 32;
   const lastAddress = subnet.network + 2 ** (32 - subnet.prefix) - 1;
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [nameInput, setNameInput] = useState(name);
+
+  function beginRename() {
+    setNameInput(name);
+    setIsRenaming(true);
+  }
+
+  function saveName() {
+    onRename(subnet.cidr, nameInput.trim());
+    setIsRenaming(false);
+  }
+
+  function handleNameKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Escape") {
+      setNameInput(name);
+      setIsRenaming(false);
+    }
+  }
 
   return (
     <div className="tree-branch">
-      <button
-        className={`subnet-node ${isSplit ? "subnet-node--parent" : ""}`}
-        data-subnet-id={subnet.cidr}
-        type="button"
-        onClick={() => canSplit && onToggle(subnet)}
-        disabled={!canSplit || isCollapsing}
-        aria-label={canSplit ? `${isSplit ? "Unsplit" : "Split"} ${subnet.cidr}` : `${subnet.cidr} network`}
-      >
-        <span className="node-heading">
-          <span className="node-prefix">/{subnet.prefix}</span>
-          <span className="node-address">{numberToIp(subnet.network)}</span>
-        </span>
-        <span className="node-range">
-          {numberToIp(subnet.network)} <ArrowDown size={12} aria-hidden="true" /> {numberToIp(lastAddress)}
-        </span>
-        <span className="node-footer">
-          <span>{formatAddresses(subnet.prefix)} addresses</span>
-          {canSplit && !isSplit && <span className="split-hint"><Split size={13} aria-hidden="true" /> Split</span>}
-          {isSplit && <span className="unsplit-hint"><RotateCcw size={13} aria-hidden="true" /> Unsplit</span>}
-          {!canSplit && <span className="host-label">Single host</span>}
-        </span>
-      </button>
+      <div className={`subnet-node ${isSplit ? "subnet-node--parent" : ""}`} data-subnet-id={subnet.cidr}>
+        {isRenaming ? (
+          <form className="node-name-editor" onSubmit={(event) => { event.preventDefault(); saveName(); }} data-export-ignore="true">
+            <input
+              autoFocus
+              aria-label={`Name for ${subnet.cidr}`}
+              maxLength={32}
+              onChange={(event) => setNameInput(event.target.value)}
+              onFocus={(event) => event.currentTarget.select()}
+              onKeyDown={handleNameKeyDown}
+              placeholder="Block name"
+              value={nameInput}
+            />
+            <button type="submit" title="Save name" aria-label={`Save name for ${subnet.cidr}`}><Check size={14} aria-hidden="true" /></button>
+            <button type="button" onClick={() => { setNameInput(name); setIsRenaming(false); }} title="Cancel rename" aria-label="Cancel rename"><X size={14} aria-hidden="true" /></button>
+          </form>
+        ) : (
+          <button className={`node-name-button ${name ? "node-name-button--named" : ""}`} type="button" onClick={beginRename} title={name ? "Rename block" : "Name block"} aria-label={`${name ? "Rename" : "Name"} ${subnet.cidr}`}>
+            <span>{name || "Name block"}</span><Pencil size={12} aria-hidden="true" />
+          </button>
+        )}
+        <button
+          className="node-split-button"
+          type="button"
+          onClick={() => canSplit && onToggle(subnet)}
+          disabled={!canSplit || isCollapsing}
+          aria-label={canSplit ? `${isSplit ? "Unsplit" : "Split"} ${name || subnet.cidr}` : `${name || subnet.cidr} network`}
+        >
+          <span className="node-heading">
+            <span className="node-prefix">/{subnet.prefix}</span>
+            <span className="node-address">{numberToIp(subnet.network)}</span>
+          </span>
+          <span className="node-range">
+            {numberToIp(subnet.network)} <ArrowDown size={12} aria-hidden="true" /> {numberToIp(lastAddress)}
+          </span>
+          <span className="node-footer">
+            <span>{formatAddresses(subnet.prefix)} addresses</span>
+            {canSplit && !isSplit && <span className="split-hint"><Split size={13} aria-hidden="true" /> Split</span>}
+            {isSplit && <span className="unsplit-hint"><RotateCcw size={13} aria-hidden="true" /> Unsplit</span>}
+            {!canSplit && <span className="host-label">Single host</span>}
+          </span>
+        </button>
+      </div>
 
       {isSplit && (
         <div className={`children-wrap ${isCollapsing ? "children-wrap--collapsing" : ""}`}>
           <div className="tree-stem" aria-hidden="true" />
           <div className="tree-children">
             {childSubnets(subnet).map((child) => (
-              <SubnetNode key={child.cidr} subnet={child} splitIds={splitIds} collapsingIds={collapsingIds} onToggle={onToggle} />
+              <SubnetNode key={child.cidr} subnet={child} name={nameByCidr[child.cidr] ?? ""} nameByCidr={nameByCidr} splitIds={splitIds} collapsingIds={collapsingIds} onRename={onRename} onToggle={onToggle} />
             ))}
           </div>
         </div>
@@ -101,6 +190,7 @@ export default function SubnetPlanner() {
   const [cidrInput, setCidrInput] = useState(INITIAL_CIDR);
   const [root, setRoot] = useState<Subnet | null>(null);
   const [splitOrder, setSplitOrder] = useState<string[]>([]);
+  const [nameByCidr, setNameByCidr] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [exportError, setExportError] = useState("");
   const [isExporting, setIsExporting] = useState(false);
@@ -109,6 +199,7 @@ export default function SubnetPlanner() {
   const layoutAnimationsRef = useRef<Map<string, Animation>>(new Map());
   const previousNodePositionsRef = useRef<Map<string, DOMRect>>(new Map());
   const treeCanvasRef = useRef<HTMLDivElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
   const splitIds = new Set(splitOrder);
   const nodeCount = 1 + splitOrder.length * 2;
   const leafCount = 1 + splitOrder.length;
@@ -195,6 +286,7 @@ export default function SubnetPlanner() {
     setRoot(subnet);
     setCidrInput(subnet.cidr);
     setSplitOrder([]);
+    setNameByCidr({});
     setError("");
   }
 
@@ -202,6 +294,7 @@ export default function SubnetPlanner() {
     clearPendingCollapses();
     setRoot(null);
     setSplitOrder([]);
+    setNameByCidr({});
     setError("");
     setExportError("");
   }
@@ -233,6 +326,55 @@ export default function SubnetPlanner() {
     setSplitOrder((current) => current.slice(0, -1));
   }
 
+  function renameSubnet(cidr: string, name: string) {
+    setNameByCidr((current) => {
+      const next = { ...current };
+      if (name) next[cidr] = name;
+      else delete next[cidr];
+      return next;
+    });
+  }
+
+  function exportJson() {
+    if (!root) return;
+
+    const document: PlannerDocument = {
+      format: "subnet-studio",
+      version: 1,
+      root: root.cidr,
+      splits: splitOrder,
+      names: nameByCidr,
+    };
+    const url = URL.createObjectURL(new Blob([`${JSON.stringify(document, null, 2)}\n`], { type: "application/json" }));
+    const link = window.document.createElement("a");
+    link.download = `subnet-tree-${root.cidr.replace("/", "-")}.json`;
+    link.href = url;
+    window.document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setExportError("");
+  }
+
+  async function importJson(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    try {
+      const document = parsePlannerDocument(JSON.parse(await file.text()));
+      clearPendingCollapses();
+      setRoot(document.root);
+      setCidrInput(document.root.cidr);
+      setSplitOrder(document.splits);
+      setNameByCidr(document.names);
+      setError("");
+      setExportError("");
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "The JSON file could not be imported.");
+    }
+  }
+
   async function exportTree() {
     if (!root || !treeCanvasRef.current) return;
 
@@ -245,6 +387,7 @@ export default function SubnetPlanner() {
       const dataUrl = await toPng(canvas, {
         backgroundColor: "#fcfcfb",
         cacheBust: true,
+        filter: (node) => !(node instanceof HTMLElement && node.dataset.exportIgnore === "true"),
         pixelRatio: 2,
         width: canvas.scrollWidth,
         height: canvas.scrollHeight,
@@ -320,6 +463,13 @@ export default function SubnetPlanner() {
             </div>
           </div>
           <div className="tree-actions">
+            <input ref={importInputRef} type="file" accept="application/json,.json" onChange={importJson} hidden />
+            <button className="icon-button" type="button" onClick={() => importInputRef.current?.click()} title="Import JSON" aria-label="Import JSON">
+              <FileUp size={17} aria-hidden="true" />
+            </button>
+            <button className="icon-button" type="button" onClick={exportJson} disabled={!root || collapsingIds.size > 0} title="Export JSON" aria-label="Export JSON">
+              <FileDown size={17} aria-hidden="true" />
+            </button>
             <button className="export-button" type="button" onClick={exportTree} disabled={!root || isExporting || collapsingIds.size > 0}>
               {isExporting ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
               {isExporting ? "Exporting" : "Export PNG"}
@@ -338,7 +488,7 @@ export default function SubnetPlanner() {
         <div ref={treeCanvasRef} className={`tree-canvas ${root ? "tree-canvas--active" : ""}`}>
           {root && <p className="export-title">Subnet Studio · {root.cidr}</p>}
           {root ? (
-            <SubnetNode subnet={root} splitIds={splitIds} collapsingIds={collapsingIds} onToggle={toggleSubnet} />
+            <SubnetNode subnet={root} name={nameByCidr[root.cidr] ?? ""} nameByCidr={nameByCidr} splitIds={splitIds} collapsingIds={collapsingIds} onRename={renameSubnet} onToggle={toggleSubnet} />
           ) : (
             <div className="empty-state">
               <span className="empty-graphic" aria-hidden="true"><Network size={32} /></span>
