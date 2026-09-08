@@ -117,8 +117,8 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   border-radius: 8px;
   box-shadow: 0 24px 60px rgba(16, 29, 44, 0.08);
   margin: 0 auto;
-  max-width: 1220px;
   overflow: hidden;
+  width: calc(100% - clamp(32px, 5vw, 144px));
 }
 .network-form {
   background: #fbfcfc;
@@ -412,7 +412,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .legend-tip { margin-left: auto; }
 
 @media (max-width: 1279px) {
-  .workspace { border-left: 0; border-radius: 0; border-right: 0; }
+  .workspace { border-left: 0; border-radius: 0; border-right: 0; width: 100%; }
 }
 @media (max-width: 720px) {
   .app-shell { padding-bottom: 0; }
