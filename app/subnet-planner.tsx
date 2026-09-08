@@ -1,9 +1,10 @@
 "use client";
 
-import { ArrowDown, Check, CornerDownRight, Download, FileDown, FileUp, LoaderCircle, Network, Pencil, RotateCcw, Split, Undo2, X } from "lucide-react";
+import { ArrowDown, Check, CornerDownRight, Download, FileDown, FileUp, Heart, LoaderCircle, Network, Pencil, RotateCcw, Split, Undo2, X } from "lucide-react";
 import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type Subnet = { cidr: string; network: number; prefix: number };
+type SplitState = { order: string[]; undoStack: string[][] };
 type PlannerDocument = {
   format: "subnet-studio";
   version: 1;
@@ -93,12 +94,13 @@ function parsePlannerDocument(value: unknown): { root: Subnet; splits: string[];
   return { root, splits, names };
 }
 
-function SubnetNode({ subnet, name, nameByCidr, splitIds, collapsingIds, onRename, onToggle }: {
+function SubnetNode({ subnet, name, nameByCidr, splitIds, collapsingIds, isTreeBusy, onRename, onToggle }: {
   subnet: Subnet;
   name: string;
   nameByCidr: Record<string, string>;
   splitIds: Set<string>;
   collapsingIds: Set<string>;
+  isTreeBusy: boolean;
   onRename: (cidr: string, name: string) => void;
   onToggle: (subnet: Subnet) => void;
 }) {
@@ -153,7 +155,7 @@ function SubnetNode({ subnet, name, nameByCidr, splitIds, collapsingIds, onRenam
           className="node-split-button"
           type="button"
           onClick={() => canSplit && onToggle(subnet)}
-          disabled={!canSplit || isCollapsing}
+          disabled={!canSplit || isTreeBusy}
           aria-label={canSplit ? `${isSplit ? "Unsplit" : "Split"} ${name || subnet.cidr}` : `${name || subnet.cidr} network`}
         >
           <span className="node-heading">
@@ -177,7 +179,7 @@ function SubnetNode({ subnet, name, nameByCidr, splitIds, collapsingIds, onRenam
           <div className="tree-stem" aria-hidden="true" />
           <div className="tree-children">
             {childSubnets(subnet).map((child) => (
-              <SubnetNode key={child.cidr} subnet={child} name={nameByCidr[child.cidr] ?? ""} nameByCidr={nameByCidr} splitIds={splitIds} collapsingIds={collapsingIds} onRename={onRename} onToggle={onToggle} />
+              <SubnetNode key={child.cidr} subnet={child} name={nameByCidr[child.cidr] ?? ""} nameByCidr={nameByCidr} splitIds={splitIds} collapsingIds={collapsingIds} isTreeBusy={isTreeBusy} onRename={onRename} onToggle={onToggle} />
             ))}
           </div>
         </div>
@@ -189,7 +191,7 @@ function SubnetNode({ subnet, name, nameByCidr, splitIds, collapsingIds, onRenam
 export default function SubnetPlanner() {
   const [cidrInput, setCidrInput] = useState(INITIAL_CIDR);
   const [root, setRoot] = useState<Subnet | null>(null);
-  const [splitOrder, setSplitOrder] = useState<string[]>([]);
+  const [splitState, setSplitState] = useState<SplitState>({ order: [], undoStack: [] });
   const [nameByCidr, setNameByCidr] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [exportError, setExportError] = useState("");
@@ -200,6 +202,7 @@ export default function SubnetPlanner() {
   const previousNodePositionsRef = useRef<Map<string, DOMRect>>(new Map());
   const treeCanvasRef = useRef<HTMLDivElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const splitOrder = splitState.order;
   const splitIds = new Set(splitOrder);
   const nodeCount = 1 + splitOrder.length * 2;
   const leafCount = 1 + splitOrder.length;
@@ -285,7 +288,7 @@ export default function SubnetPlanner() {
     clearPendingCollapses();
     setRoot(subnet);
     setCidrInput(subnet.cidr);
-    setSplitOrder([]);
+    setSplitState({ order: [], undoStack: [] });
     setNameByCidr({});
     setError("");
   }
@@ -293,7 +296,7 @@ export default function SubnetPlanner() {
   function resetTree() {
     clearPendingCollapses();
     setRoot(null);
-    setSplitOrder([]);
+    setSplitState({ order: [], undoStack: [] });
     setNameByCidr({});
     setError("");
     setExportError("");
@@ -302,7 +305,10 @@ export default function SubnetPlanner() {
   function toggleSubnet(subnet: Subnet) {
     if (!splitIds.has(subnet.cidr)) {
       captureNodePositions();
-      setSplitOrder((current) => [...current, subnet.cidr]);
+      setSplitState((current) => ({
+        order: [...current.order, subnet.cidr],
+        undoStack: [...current.undoStack, current.order],
+      }));
       return;
     }
 
@@ -310,7 +316,10 @@ export default function SubnetPlanner() {
     const duration = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 380;
     const timer = setTimeout(() => {
       captureNodePositions();
-      setSplitOrder((current) => current.filter((cidr) => !isWithinSubnet(cidr, subnet)));
+      setSplitState((current) => ({
+        order: current.order.filter((cidr) => !isWithinSubnet(cidr, subnet)),
+        undoStack: [...current.undoStack, current.order],
+      }));
       setCollapsingIds((current) => {
         const next = new Set(current);
         next.delete(subnet.cidr);
@@ -321,9 +330,12 @@ export default function SubnetPlanner() {
     collapseTimersRef.current.set(subnet.cidr, timer);
   }
 
-  function undoLastSplit() {
+  function undoLastAction() {
     captureNodePositions();
-    setSplitOrder((current) => current.slice(0, -1));
+    setSplitState((current) => ({
+      order: current.undoStack.at(-1) ?? current.order,
+      undoStack: current.undoStack.slice(0, -1),
+    }));
   }
 
   function renameSubnet(cidr: string, name: string) {
@@ -366,7 +378,10 @@ export default function SubnetPlanner() {
       clearPendingCollapses();
       setRoot(document.root);
       setCidrInput(document.root.cidr);
-      setSplitOrder(document.splits);
+      setSplitState({
+        order: document.splits,
+        undoStack: document.splits.map((_, index) => document.splits.slice(0, index)),
+      });
       setNameByCidr(document.names);
       setError("");
       setExportError("");
@@ -474,7 +489,7 @@ export default function SubnetPlanner() {
               {isExporting ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
               {isExporting ? "Exporting" : "Export PNG"}
             </button>
-            <button className="icon-button" type="button" onClick={undoLastSplit} disabled={!splitOrder.length || collapsingIds.size > 0} title="Undo last split" aria-label="Undo last split">
+            <button className="icon-button" type="button" onClick={undoLastAction} disabled={!splitState.undoStack.length || collapsingIds.size > 0} title="Undo last action" aria-label="Undo last action">
               <Undo2 size={17} aria-hidden="true" />
             </button>
             <button className="icon-button" type="button" onClick={resetTree} disabled={!root} title="Reset workspace" aria-label="Reset workspace">
@@ -488,7 +503,7 @@ export default function SubnetPlanner() {
         <div ref={treeCanvasRef} className={`tree-canvas ${root ? "tree-canvas--active" : ""}`}>
           {root && <p className="export-title">Subnet Studio · {root.cidr}</p>}
           {root ? (
-            <SubnetNode subnet={root} name={nameByCidr[root.cidr] ?? ""} nameByCidr={nameByCidr} splitIds={splitIds} collapsingIds={collapsingIds} onRename={renameSubnet} onToggle={toggleSubnet} />
+            <SubnetNode subnet={root} name={nameByCidr[root.cidr] ?? ""} nameByCidr={nameByCidr} splitIds={splitIds} collapsingIds={collapsingIds} isTreeBusy={collapsingIds.size > 0} onRename={renameSubnet} onToggle={toggleSubnet} />
           ) : (
             <div className="empty-state">
               <span className="empty-graphic" aria-hidden="true"><Network size={32} /></span>
@@ -504,6 +519,23 @@ export default function SubnetPlanner() {
           <span className="legend-tip"><Split size={13} aria-hidden="true" /> Select a leaf node to split it</span>
         </footer>
       </section>
+
+      <footer className="site-footer">
+        <a
+          className="author-link"
+          href="https://www.linkedin.com/in/deividsmarzaro/"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="Built with love by Deivid Smarzaro on LinkedIn"
+        >
+          <span>Built with</span>
+          <Heart className="author-heart" size={14} fill="currentColor" aria-hidden="true" />
+          <span>by Deivid Smarzaro</span>
+          <svg className="linkedin-icon" width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.85 0-2.14 1.45-2.14 2.94v5.67H9.35V9h3.41v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28ZM5.34 7.43a2.06 2.06 0 1 1 0-4.12 2.06 2.06 0 0 1 0 4.12ZM7.12 20.45H3.56V9h3.56v11.45ZM22.23 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.23.79 24 1.77 24h20.45C23.2 24 24 23.23 24 22.27V1.73C24 .77 23.2 0 22.22 0Z" />
+          </svg>
+        </a>
+      </footer>
     </main>
   );
 }
